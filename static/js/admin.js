@@ -318,6 +318,18 @@ function _isLocalEndpoint(url) {
   } catch { return false; }
 }
 
+// A loopback endpoint may register read-only diagnostic sections
+// (`diagnostics_sections`, served from its validated diagnostics_paths map).
+// The admin-only "Doctor" control is shown whenever any section exists.
+function _endpointDiagnosticSections(ep) {
+  if (!ep || !Array.isArray(ep.diagnostics_sections)) return [];
+  return ep.diagnostics_sections.filter(s => typeof s === 'string' && s);
+}
+
+function _endpointHasDiagnostics(ep) {
+  return _endpointDiagnosticSections(ep).length > 0;
+}
+
 async function _refreshAfterEndpointChange(deletedEndpointId) {
   try {
     const sm = window.sessionModule;
@@ -411,6 +423,8 @@ async function loadEndpoints() {
           ? `<span class="admin-badge">${visibleCount}/${totalCount} models enabled</span>`
           : '<span class="admin-badge admin-badge-off">offline</span>';
       const justAddedClass = (_recentlyAddedEpId && String(ep.id) === _recentlyAddedEpId) ? ' adm-ep-just-added' : '';
+      const diagSections = _endpointDiagnosticSections(ep);
+      const showDoctor = diagSections.length > 0;
       return `
         <div class="admin-user-row${ep.is_enabled ? '' : ' admin-ep-disabled'}${justAddedClass}" data-adm-ep-id="${ep.id}">
           <div style="display:flex;align-items:center;justify-content:space-between;${hasModels ? 'cursor:pointer;' : ''}padding:4px 0;" data-adm-ep-header="${ep.id}">
@@ -422,12 +436,14 @@ async function loadEndpoints() {
               ${hasModels ? '<span style="font-size:10px;opacity:0.4;">Click to manage models</span>' : ''}
             </div>
             <div style="display:flex;gap:4px;align-items:center;">
+              ${showDoctor ? `${diagSections.length > 1 ? `<select class="admin-btn-sm" data-adm-diag-section="${ep.id}" title="Diagnostic section">${diagSections.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('')}</select>` : ''}<button class="admin-btn-sm" data-adm-diag="${ep.id}" title="Fetch read-only diagnostics">Doctor</button>` : ''}
               <button class="admin-btn-sm" data-adm-toggle-ep="${ep.id}">${ep.is_enabled ? 'Disable' : 'Enable'}</button>
               <button class="admin-btn-delete" data-adm-del-ep="${ep.id}" data-adm-ep-online="${ep.online ? '1' : '0'}">Delete</button>
               ${hasModels ? '<svg class="admin-user-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.3;transition:transform 0.2s,opacity 0.2s;"><polyline points="6 9 12 15 18 9"/></svg>' : ''}
             </div>
           </div>
           <div class="admin-ep-detail">${esc(ep.base_url)}${_isLocalEndpoint(ep.base_url) ? `<button type="button" class="admin-ep-copy-btn" data-adm-copy-url="${esc(ep.base_url)}" title="Copy URL" aria-label="Copy URL" style="background:none;border:none;padding:0 2px;margin-left:6px;cursor:pointer;color:inherit;opacity:0.45;vertical-align:-2px;line-height:1;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>` : ''}${ep.has_key ? ' (key set)' : ''}</div>
+          ${showDoctor ? `<pre class="mcp-tools-panel hidden" data-adm-diag-panel="${ep.id}" style="white-space:pre-wrap;max-height:260px;overflow:auto;font-size:11px;"></pre>` : ''}
           ${hasModels ? `<div class="mcp-tools-panel hidden" data-adm-ep-models-panel="${ep.id}"></div>` : ''}
         </div>`;
     });
@@ -479,6 +495,33 @@ async function loadEndpoints() {
           btn.style.opacity = '1';
           setTimeout(() => { btn.innerHTML = prev; btn.style.opacity = ''; }, 1400);
         }).catch(() => {});
+      });
+    });
+    queryAll('[data-adm-diag]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const epId = btn.dataset.admDiag;
+        const row = btn.closest('[data-adm-ep-id]');
+        const panel = row && row.querySelector(`[data-adm-diag-panel="${epId}"]`);
+        if (!panel) return;
+        const sel = row && row.querySelector(`[data-adm-diag-section="${epId}"]`);
+        const section = sel ? sel.value : '';
+        panel.classList.remove('hidden');
+        panel.textContent = 'Loading diagnostics...';
+        btn.disabled = true;
+        try {
+          const qs = section ? `?section=${encodeURIComponent(section)}` : '';
+          const res = await fetch(`/api/model-endpoints/${epId}/diagnostics${qs}`, { credentials: 'same-origin' });
+          const d = await res.json();
+          if (!res.ok) {
+            panel.textContent = d.detail || d.error || 'Diagnostics failed';
+          } else {
+            panel.textContent = JSON.stringify(d.data, null, 2);
+          }
+        } catch (err) {
+          panel.textContent = 'Diagnostics request failed';
+        }
+        btn.disabled = false;
       });
     });
     queryAll('[data-adm-del-ep]').forEach(btn => {
@@ -744,6 +787,32 @@ function initEndpointForm() {
     return 'http://127.0.0.1:11434/v1';
   }
 
+  // Optional, operator-provided quick-add defaults for a self-hosted/loopback
+  // wrapper endpoint. Served (admin-only) by /api/runtime when the LOCAL_ENDPOINT_*
+  // env vars are set; absent on stock installs. Cached for the page lifetime.
+  let _localDefaultCache; // undefined=unfetched, null=none, object=default
+  async function _fetchLocalEndpointDefault() {
+    if (_localDefaultCache !== undefined) return _localDefaultCache;
+    _localDefaultCache = null;
+    try {
+      const res = await fetch('/api/runtime', { credentials: 'same-origin' });
+      if (res.ok) {
+        const data = await res.json();
+        const def = data && data.local_endpoint_default;
+        if (def && def.url) _localDefaultCache = def;
+      }
+    } catch (_) {}
+    return _localDefaultCache;
+  }
+
+  function _urlsEquivalent(a, b) {
+    try {
+      const ua = new URL(a), ub = new URL(b);
+      return ua.protocol === ub.protocol && ua.host === ub.host
+        && ua.pathname.replace(/\/+$/, '') === ub.pathname.replace(/\/+$/, '');
+    } catch (_) { return false; }
+  }
+
   function _renderEndpointTestResult(msg, res, d) {
     if (res.ok && d.status === 'empty') {
       msg.textContent = 'Online — no models found';
@@ -882,6 +951,13 @@ function initEndpointForm() {
         const res = await fetch('/api/model-endpoints/test', { method: 'POST', body: fd, credentials: 'same-origin' });
         const d = await res.json();
         _renderEndpointTestResult(msg, res, d);
+        if (!res.ok && !apiKey) {
+          const def = await _fetchLocalEndpointDefault();
+          if (def && _urlsEquivalent(url, def.url)) {
+            msg.textContent = 'This endpoint may require its server bearer token unless auth is disabled.';
+            msg.className = 'admin-error';
+          }
+        }
       } catch (e) {
         msg.textContent = 'Test failed: ' + (e && e.message ? e.message : 'request failed');
         msg.className = 'admin-error';
@@ -906,6 +982,16 @@ function initEndpointForm() {
         if (apiKey) fd.append('api_key', apiKey);
         const lt = el('adm-epLocalType');
         if (lt) fd.append('model_type', lt.value);
+        // When adding the operator-configured local wrapper, apply its name,
+        // tool-support flag and diagnostics so the quick-add is one-click.
+        const def = await _fetchLocalEndpointDefault();
+        if (def && _urlsEquivalent(url, def.url)) {
+          if (def.name) fd.append('name', def.name);
+          if (def.supports_tools === false) fd.append('supports_tools', 'false');
+          else if (def.supports_tools === true) fd.append('supports_tools', 'true');
+          if (def.diagnostics_paths) fd.append('diagnostics_paths', JSON.stringify(def.diagnostics_paths));
+          fd.append('require_models', 'true');
+        }
         fd.append('skip_probe', 'false');
         const res = await fetch('/api/model-endpoints', { method: 'POST', body: fd, credentials: 'same-origin' });
         const d = await res.json();
@@ -942,6 +1028,30 @@ function initEndpointForm() {
         msg.innerHTML = '<span style="font-size:11px;opacity:0.55;">Ollama ready to test.</span>';
         msg.className = '';
       }
+    });
+  }
+
+  // Local-wrapper quick-add: only shown when the operator configured a default
+  // via the LOCAL_ENDPOINT_* env vars (admin-only). Stock installs hide it.
+  const localWrapperBtn = el('adm-epLocalWrapperBtn');
+  if (localWrapperBtn) {
+    _fetchLocalEndpointDefault().then(def => {
+      if (!def) { localWrapperBtn.remove(); return; }
+      if (def.name) localWrapperBtn.textContent = def.name;
+      localWrapperBtn.hidden = false;
+      localWrapperBtn.addEventListener('click', () => {
+        const input = el('adm-epLocalUrl');
+        if (input) { input.value = def.url; input.focus(); }
+        const type = el('adm-epLocalType');
+        if (type) type.value = 'llm';
+        const key = el('adm-epLocalApiKey');
+        if (key) key.focus();
+        const msg = _endpointMsg('local');
+        if (msg) {
+          msg.innerHTML = '<span style="font-size:11px;opacity:0.55;">Paste the server bearer token if required, then test or add.</span>';
+          msg.className = '';
+        }
+      });
     });
   }
 

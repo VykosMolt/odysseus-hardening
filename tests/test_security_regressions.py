@@ -943,7 +943,6 @@ def test_mcp_oauth_page_escapes_reflected_values():
         assert f"{var} = html.escape({var}" in body, var
 
 
-
 # -- export/gallery filename hardening ----------------------------------------
 
 def _install_route_import_stubs(monkeypatch):
