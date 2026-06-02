@@ -11,7 +11,8 @@ import logging
 
 from core.database import Comparison, SessionLocal
 from core.session_manager import SessionManager
-from src.auth_helpers import get_current_user
+from src.auth_helpers import get_current_user, owner_filter
+from routes.session_routes import _reject_raw_endpoint_url_for_non_admin
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +44,14 @@ def setup_compare_routes(session_manager: SessionManager):
         Returns the comparison ID and the two session IDs so the client
         can fire two independent SSE streams to /api/chat_stream.
         """
+        user = getattr(request.state, 'current_user', None)
         comp_id = str(uuid.uuid4())
         sid_a = str(uuid.uuid4())
         sid_b = str(uuid.uuid4())
 
         # Create ephemeral sessions (prefixed [CMP])
         for sid, model, endpoint in [(sid_a, model_a, endpoint_a), (sid_b, model_b, endpoint_b)]:
-            user = getattr(request.state, 'current_user', None)
+            _reject_raw_endpoint_url_for_non_admin(request, user, None, endpoint)
             session_manager.create_session(
                 session_id=sid,
                 name=f"[CMP] {model.split('/')[-1]}",
@@ -65,9 +67,12 @@ def setup_compare_routes(session_manager: SessionManager):
                 from src.endpoint_resolver import build_headers, normalize_base
                 # Find matching endpoint by URL
                 base = normalize_base(endpoint)
-                ep = db.query(ModelEndpoint).filter(
+                q = db.query(ModelEndpoint).filter(
                     ModelEndpoint.base_url == base
-                ).first()
+                )
+                if user:
+                    q = owner_filter(q, ModelEndpoint, user)
+                ep = q.first()
                 if ep and ep.api_key:
                     s = session_manager.sessions.get(sid)
                     if s:

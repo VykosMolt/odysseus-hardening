@@ -37,13 +37,14 @@ def _first_chat_model(models) -> str:
     return (models[0] if models else "")
 
 
-def _resolve_research_endpoint(sess) -> tuple:
+def _resolve_research_endpoint(sess, owner: Optional[str] = None) -> tuple:
     """Return (endpoint_url, model, headers) for Deep Research, checking admin overrides."""
     url, model, headers = resolve_endpoint(
         "research",
         fallback_url=sess.endpoint_url,
         fallback_model=sess.model,
         fallback_headers=sess.headers,
+        owner=owner,
     )
     return url, model, headers
 
@@ -351,7 +352,11 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                 ep = db.query(ModelEndpoint).filter(
                     ModelEndpoint.id == body.endpoint_id,
                     ModelEndpoint.is_enabled == True,
-                ).first()
+                )
+                if user:
+                    from src.auth_helpers import owner_filter
+                    ep = owner_filter(ep, ModelEndpoint, user)
+                ep = ep.first()
                 if not ep:
                     raise HTTPException(404, "Endpoint not found or disabled")
                 base = normalize_base(ep.base_url)
@@ -369,26 +374,30 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             finally:
                 db.close()
         else:
-            ep_url, ep_model, ep_headers = resolve_endpoint("research")
+            ep_url, ep_model, ep_headers = resolve_endpoint("research", owner=user)
             if not ep_url:
-                ep_url, ep_model, ep_headers = resolve_endpoint("utility")
+                ep_url, ep_model, ep_headers = resolve_endpoint("utility", owner=user)
             # When neither research nor utility is configured, use the user's
             # configured DEFAULT model (default_endpoint_id/default_model) rather
             # than arbitrarily grabbing the first enabled endpoint's first model
             # (which surfaced gpt-3.5). "Default" should mean the default model.
             if not ep_url:
-                ep_url, ep_model, ep_headers = resolve_endpoint("default")
+                ep_url, ep_model, ep_headers = resolve_endpoint("default", owner=user)
             if not ep_url:
-                ep_url, ep_model, ep_headers = resolve_endpoint("chat")
+                ep_url, ep_model, ep_headers = resolve_endpoint("chat", owner=user)
             if not ep_url:
                 from src.database import SessionLocal
                 from src.database import ModelEndpoint
                 from src.endpoint_resolver import normalize_base, build_chat_url, build_headers
                 db = SessionLocal()
                 try:
-                    ep = db.query(ModelEndpoint).filter(
+                    q = db.query(ModelEndpoint).filter(
                         ModelEndpoint.is_enabled == True,
-                    ).first()
+                    )
+                    if user:
+                        from src.auth_helpers import owner_filter
+                        q = owner_filter(q, ModelEndpoint, user)
+                    ep = q.first()
                     if ep:
                         base = normalize_base(ep.base_url)
                         ep_url = build_chat_url(base)
@@ -548,11 +557,11 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                 ep_headers = dict(r_headers)
 
         if not ep_url or not ep_model:
-            _merge(*resolve_endpoint("chat"))
+            _merge(*resolve_endpoint("chat", owner=user))
         if not ep_url or not ep_model:
-            _merge(*resolve_endpoint("research"))
+            _merge(*resolve_endpoint("research", owner=user))
         if not ep_url or not ep_model:
-            _merge(*resolve_endpoint("utility"))
+            _merge(*resolve_endpoint("utility", owner=user))
         if not ep_url or not ep_model:
             # Last resort: any enabled endpoint
             from src.database import SessionLocal
@@ -560,7 +569,11 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
             from src.endpoint_resolver import normalize_base, build_chat_url, build_headers
             db = SessionLocal()
             try:
-                ep = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True).first()
+                q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+                if user:
+                    from src.auth_helpers import owner_filter
+                    q = owner_filter(q, ModelEndpoint, user)
+                ep = q.first()
                 if ep:
                     base = normalize_base(ep.base_url)
                     fallback_url = build_chat_url(base)
